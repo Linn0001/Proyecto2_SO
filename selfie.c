@@ -104,6 +104,7 @@ uint64_t write(uint64_t fd, uint64_t* buffer, uint64_t bytes_to_write);
 uint64_t open(char* filename, uint64_t flags, ...);
 int fork();
 uint64_t wait(uint64_t* wstatus);
+uint64_t lseek(uint64_t fd, uint64_t offset, uint64_t whence);
 // selfie bootstraps void* to uint64_t* and unsigned to uint64_t!
 void* malloc(unsigned long);
 
@@ -285,6 +286,8 @@ uint64_t S_IRUSR_IWUSR_IRGRP_IROTH = 420;
 // 493 = 00755 = S_IRUSR_IWUSR_IRGRP_IROTH | S_IXUSR (00100) | S_IXGRP (00010) | S_IXOTH (00001)
 // these flags also seem to be working for LINUX, MAC, and WINDOWS
 uint64_t S_IRUSR_IWUSR_IXUSR_IRGRP_IXGRP_IROTH_IXOTH = 493;
+
+uint64_t SEEK_SET = 0;
 
 // ------------------------ GLOBAL VARIABLES -----------------------
 
@@ -1287,6 +1290,9 @@ void     implement_brk(uint64_t* context);
 void	emit_fork();
 void 	implement_fork(uint64_t* context);
 
+void emit_mmap();
+void implement_mmap(uint64_t* context);
+
 void	emit_wait();
 void	implement_wait(uint64_t* context);
 
@@ -1305,8 +1311,13 @@ uint64_t SYSCALL_WRITE  = 64;
 uint64_t SYSCALL_OPENAT = 56;
 uint64_t SYSCALL_BRK    = 214;
 
+uint64_t SYSCALL_MMAP 	= 14;
+uint64_t SYSCALL_MUNMAP	= 16;
+
 uint64_t SYSCALL_FORK	= 215;
 uint64_t SYSCALL_WAIT	= 216;
+
+uint64_t MAPPING_ENTRIES = 6;
 
 /* DIRFD_AT_FDCWD corresponds to AT_FDCWD in fcntl.h and
    is passed as first argument of the openat system call
@@ -2226,11 +2237,13 @@ void unblock_context(uint64_t* context);
 // | 35 | number of children	| number of forked children
 // | 36 | child exit code		| exit status code of last exited child
 // | 37 | child pid				| pid of exited child
+// | 38 | mappings            | pointer to head of mmap mappings list
+// | 39 | mmap base           | el virtual address siguiente para las regiones mmap
 
 // number of entries of a machine context:
 // 14 uint64_t + 6 uint64_t* + 1 char* + 7 uint64_t + 2 uint64_t* + 2 uint64_t entries
 // extended in the symbolic execution engine and the Boehm garbage collector
-uint64_t CONTEXTENTRIES = 38;
+uint64_t CONTEXTENTRIES = 40;
 uint64_t N_CONTEXTS = 0;
 uint64_t* RUNNING = (uint64_t*) 0;
 uint64_t N_BLOCKED_CONTEXTS = 0;
@@ -2288,6 +2301,8 @@ uint64_t status(uint64_t* context) { return (uint64_t) (context + 34); }
 uint64_t nchildren(uint64_t* context) { return (uint64_t) (context + 35); }
 uint64_t child_exit_code(uint64_t* context) { return (uint64_t) (context + 36); }
 uint64_t child_pid(uint64_t* context) { return (uint64_t) (context + 37); }
+uint64_t mmapings(uint64_t* context) { return (uint64_t) (context + 38); }
+uint64_t mmap_base(uint64_t* context) { return (uint64_t) (context + 39); }
 
 uint64_t* get_next_context(uint64_t* context)    { return (uint64_t*) *context; }
 uint64_t* get_prev_context(uint64_t* context)    { return (uint64_t*) *(context + 1); }
@@ -2329,6 +2344,8 @@ uint64_t get_status(uint64_t* context) { return *(context + 34); }
 uint64_t get_nchildren(uint64_t* context) { return *(context + 35); }
 uint64_t get_child_exit_code(uint64_t* context) { return *(context + 36); }
 uint64_t get_child_pid (uint64_t* context) { return *(context + 37); }
+uint64_t* get_mappings(uint64_t* context)          { return (uint64_t*) *(context + 38); }
+uint64_t get_mmap_base(uint64_t* context)          { return *(context + 39); }
 
 void set_next_context(uint64_t* context, uint64_t* next)     { *context        = (uint64_t) next; }
 void set_prev_context(uint64_t* context, uint64_t* prev)     { *(context + 1)  = (uint64_t) prev; }
@@ -2370,6 +2387,29 @@ void set_status(uint64_t* context, uint64_t status) { *(context + 34) = status; 
 void set_nchildren(uint64_t* context, uint64_t nchildren) { *(context + 35) = nchildren; }
 void set_child_exit_code(uint64_t* context, uint64_t exit_code) { *(context + 36) = exit_code; }
 void set_child_pid(uint64_t* context, uint64_t child_pid) { *(context + 37) = child_pid; }
+void set_mappings(uint64_t* context, uint64_t* mappings) { *(context + 38) = (uint64_t) mappings; }
+void set_mmap_base(uint64_t* context, uint64_t mmap_base) { *(context + 39) = mmap_base; }
+
+// mapping
+
+uint64_t* allocate_mapping(){
+  return smalloc(MAPPING_ENTRIES * sizeof(uint64_t));
+}
+
+
+uint64_t* get_mapping_next(uint64_t* m)   { return (uint64_t*) *m; }
+uint64_t  get_mapping_addr(uint64_t* m)   { return *(m + 1); }
+uint64_t  get_mapping_length(uint64_t* m) { return *(m + 2); }
+uint64_t  get_mapping_prot(uint64_t* m)   { return *(m + 3); }
+uint64_t  get_mapping_fd(uint64_t* m)     { return *(m + 4); }
+uint64_t  get_mapping_offset(uint64_t* m) { return *(m + 5); }
+
+void set_mapping_next(uint64_t* m, uint64_t* n)  { *m       = (uint64_t) n; }
+void set_mapping_addr(uint64_t* m, uint64_t a)   { *(m + 1) = a; }
+void set_mapping_length(uint64_t* m, uint64_t l) { *(m + 2) = l; }
+void set_mapping_prot(uint64_t* m, uint64_t p)   { *(m + 3) = p; }
+void set_mapping_fd(uint64_t* m, uint64_t f)     { *(m + 4) = f; }
+void set_mapping_offset(uint64_t* m, uint64_t o) { *(m + 5) = o; }
 
 // -----------------------------------------------------------------
 // -------------------------- MICROKERNEL --------------------------
@@ -8043,6 +8083,87 @@ void implement_brk(uint64_t* context) {
   }
 }
 
+void emit_mmap(){
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("mmap"),
+    0, PROCEDURE, UINT64STAR_T, 5, code_size);
+
+  emit_load(REG_A0, REG_SP, 0); // addr
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A1, REG_SP, 0); // length
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A2, REG_SP, 0); // prot
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A3, REG_SP, 0); // fd
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A4, REG_SP, 0); // offset
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_MMAP);
+
+  emit_ecall();
+
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+void implement_mmap(uint64_t* context) {
+  uint64_t addr;
+  uint64_t length;
+  uint64_t prot;
+  uint64_t fd;
+  uint64_t offset;
+
+  uint64_t num_pages;
+  uint64_t i;
+  uint64_t* frame;
+  uint64_t vpage;
+  uint64_t* entry;
+
+  addr   = *(get_regs(context) + REG_A0);
+  length = *(get_regs(context) + REG_A1);
+  prot   = *(get_regs(context) + REG_A2);
+  fd     = *(get_regs(context) + REG_A3);
+  offset = *(get_regs(context) + REG_A4);
+
+  length = round_up(length, PAGESIZE);
+  num_pages = length / PAGESIZE;
+
+  if (addr == 0) {
+    addr = get_mmap_base(context);
+  }
+
+  i = 0;
+  while (i < num_pages) {
+    frame = palloc();
+
+    lseek(fd, offset + i * PAGESIZE, SEEK_SET);
+    read(fd, frame, PAGESIZE);
+
+    vpage = get_page_of_virtual_address(addr + i * PAGESIZE);
+    map_page(context, vpage, (uint64_t) frame);
+
+    i = i + 1;
+  }
+
+  entry = allocate_mapping();
+  set_mapping_next(entry, get_mappings(context));
+  set_mapping_addr(entry, addr);
+  set_mapping_length(entry, length);
+  set_mapping_prot(entry, prot);
+  set_mapping_fd(entry, fd);
+  set_mapping_offset(entry, offset);
+  set_mappings(context, entry);
+
+  set_mmap_base(context, addr + length);
+
+  *(get_regs(context) + REG_A0) = addr;
+  set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+
+}
+
 void emit_fork() {
 	create_symbol_table_entry(GLOBAL_TABLE, string_copy("fork"),
 	0, PROCEDURE, UINT64_T, 0, code_size);
@@ -10155,8 +10276,13 @@ void do_ecall() {
 					read_register(REG_A1);
 					read_register(REG_A2);
 
-					if (*(registers + REG_A7) == SYSCALL_OPENAT)
-					read_register(REG_A3);
+					if (*(registers + REG_A7) == SYSCALL_OPENAT || *(registers + REG_A7) == SYSCALL_MMAP) {
+            read_register(REG_A3);
+
+            if (*(registers + REG_A7) == SYSCALL_MMAP) {
+              read_register(REG_A4);
+          }
+					}
 				}
 			}
 
@@ -11163,6 +11289,10 @@ void init_context(uint64_t* context, uint64_t* parent, uint64_t* vctxt) {
   set_gcs_in_period(context, 0);
   set_use_gc_kernel(context, GC_DISABLED);
 
+  // memory mappings
+  set_mappings(context, (uint64_t*) 0);
+  set_mmap_base(context, 2 * GIGABYTE); // ponemos la base de mmap en 2GB , que queda en la mitad de la memoria virtual, lo que lo dejaria suficientemente lejos del heap y del stack, eso entendi. 
+
   set_status(context, STATUS_READY);
   set_nchildren(context, 0);
 }
@@ -11783,6 +11913,8 @@ uint64_t handle_system_call(uint64_t* context) {
     implement_fork(context);
   else if (a7 == SYSCALL_WAIT)
     implement_wait(context);
+  else if (a7 == SYSCALL_MMAP)
+    implement_mmap(context);
   else if (a7 == SYSCALL_EXIT) {
     implement_exit(context);
 
