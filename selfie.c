@@ -104,7 +104,6 @@ uint64_t write(uint64_t fd, uint64_t* buffer, uint64_t bytes_to_write);
 uint64_t open(char* filename, uint64_t flags, ...);
 int fork();
 uint64_t wait(uint64_t* wstatus);
-uint64_t lseek(uint64_t fd, uint64_t offset, uint64_t whence);
 // selfie bootstraps void* to uint64_t* and unsigned to uint64_t!
 void* malloc(unsigned long);
 
@@ -286,8 +285,6 @@ uint64_t S_IRUSR_IWUSR_IRGRP_IROTH = 420;
 // 493 = 00755 = S_IRUSR_IWUSR_IRGRP_IROTH | S_IXUSR (00100) | S_IXGRP (00010) | S_IXOTH (00001)
 // these flags also seem to be working for LINUX, MAC, and WINDOWS
 uint64_t S_IRUSR_IWUSR_IXUSR_IRGRP_IXGRP_IROTH_IXOTH = 493;
-
-uint64_t SEEK_SET = 0;
 
 // ------------------------ GLOBAL VARIABLES -----------------------
 
@@ -1290,11 +1287,17 @@ void     implement_brk(uint64_t* context);
 void	emit_fork();
 void 	implement_fork(uint64_t* context);
 
-void emit_mmap();
-void implement_mmap(uint64_t* context);
-
 void	emit_wait();
 void	implement_wait(uint64_t* context);
+
+void emit_mmap();
+void implement_mmap(uint64_t *context);
+
+void emit_munmap();
+void implement_munmap(uint64_t *context);
+
+void emit_msync();
+void implement_msync(uint64_t *context);
 
 uint64_t is_boot_level_zero();
 
@@ -1311,13 +1314,12 @@ uint64_t SYSCALL_WRITE  = 64;
 uint64_t SYSCALL_OPENAT = 56;
 uint64_t SYSCALL_BRK    = 214;
 
-uint64_t SYSCALL_MMAP 	= 14;
-uint64_t SYSCALL_MUNMAP	= 16;
-
 uint64_t SYSCALL_FORK	= 215;
 uint64_t SYSCALL_WAIT	= 216;
 
-uint64_t MAPPING_ENTRIES = 6;
+uint64_t SYSCALL_MMAP = 9;
+uint64_t SYSCALL_MUNMAP = 11;
+uint64_t SYSCALL_MSYNC = 26;
 
 /* DIRFD_AT_FDCWD corresponds to AT_FDCWD in fcntl.h and
    is passed as first argument of the openat system call
@@ -2237,13 +2239,11 @@ void unblock_context(uint64_t* context);
 // | 35 | number of children	| number of forked children
 // | 36 | child exit code		| exit status code of last exited child
 // | 37 | child pid				| pid of exited child
-// | 38 | mappings            | pointer to head of mmap mappings list
-// | 39 | mmap base           | el virtual address siguiente para las regiones mmap
 
 // number of entries of a machine context:
 // 14 uint64_t + 6 uint64_t* + 1 char* + 7 uint64_t + 2 uint64_t* + 2 uint64_t entries
 // extended in the symbolic execution engine and the Boehm garbage collector
-uint64_t CONTEXTENTRIES = 40;
+uint64_t CONTEXTENTRIES = 39;
 uint64_t N_CONTEXTS = 0;
 uint64_t* RUNNING = (uint64_t*) 0;
 uint64_t N_BLOCKED_CONTEXTS = 0;
@@ -2301,8 +2301,36 @@ uint64_t status(uint64_t* context) { return (uint64_t) (context + 34); }
 uint64_t nchildren(uint64_t* context) { return (uint64_t) (context + 35); }
 uint64_t child_exit_code(uint64_t* context) { return (uint64_t) (context + 36); }
 uint64_t child_pid(uint64_t* context) { return (uint64_t) (context + 37); }
-uint64_t mmapings(uint64_t* context) { return (uint64_t) (context + 38); }
-uint64_t mmap_base(uint64_t* context) { return (uint64_t) (context + 39); }
+
+uint64_t *get_mappings(uint64_t *context) { return (uint64_t *) *(context + 38); }
+void set_mappings(uint64_t *context, uint64_t *vma) { *(context + 38) = (uint64_t) vma; }
+
+uint64_t *get_vma_start(uint64_t *vma) { return (uint64_t *) *vma; }
+void set_vma_start(uint64_t *vma, uint64_t *start_addr) { *vma = (uint64_t) start_addr; } 
+
+uint64_t *get_vma_end(uint64_t *vma) { return (uint64_t *) *(vma + 1); }
+void set_vma_end(uint64_t *vma, uint64_t *end_addr) { *(vma + 1) = (uint64_t) end_addr; }
+
+uint64_t get_vma_offset(uint64_t *vma) { return *(vma + 2); }
+void set_vma_offset(uint64_t *vma, uint64_t offset) { *(vma + 2) = offset; }
+
+uint64_t get_vma_fd(uint64_t *vma) { return *(vma + 3); }
+void set_vma_fd(uint64_t *vma, uint64_t fd) { *(vma + 3) = fd; }
+
+uint64_t get_vma_prot(uint64_t *vma) { return *(vma + 4); }
+void set_vma_prot(uint64_t *vma, uint64_t prot) { *(vma + 4) = prot; }
+
+uint64_t get_vma_flags(uint64_t *vma) { return *(vma + 5); }
+void set_vma_flags(uint64_t *vma, uint64_t flags) { *(vma + 5) = flags; }
+
+uint64_t *get_vma_next(uint64_t *vma) { return (uint64_t *) *(vma + 6); }
+void set_vma_next(uint64_t *vma, uint64_t *next_vma) { *(vma + 6) = (uint64_t) next_vma; }
+
+uint64_t *get_vma_prev(uint64_t *vma) { return (uint64_t *) *(vma + 7); }
+void set_vma_prev(uint64_t *vma, uint64_t *prev_vma) { *(vma + 7) = (uint64_t) prev_vma; }
+
+uint64_t *get_vma_original_pte(uint64_t *vma) { return (uint64_t *) *(vma + 8); }
+void set_vma_original_pte(uint64_t *vma, uint64_t *original_pte) { *(vma + 8) = (uint64_t) original_pte; }
 
 uint64_t* get_next_context(uint64_t* context)    { return (uint64_t*) *context; }
 uint64_t* get_prev_context(uint64_t* context)    { return (uint64_t*) *(context + 1); }
@@ -2344,8 +2372,6 @@ uint64_t get_status(uint64_t* context) { return *(context + 34); }
 uint64_t get_nchildren(uint64_t* context) { return *(context + 35); }
 uint64_t get_child_exit_code(uint64_t* context) { return *(context + 36); }
 uint64_t get_child_pid (uint64_t* context) { return *(context + 37); }
-uint64_t* get_mappings(uint64_t* context)          { return (uint64_t*) *(context + 38); }
-uint64_t get_mmap_base(uint64_t* context)          { return *(context + 39); }
 
 void set_next_context(uint64_t* context, uint64_t* next)     { *context        = (uint64_t) next; }
 void set_prev_context(uint64_t* context, uint64_t* prev)     { *(context + 1)  = (uint64_t) prev; }
@@ -2387,29 +2413,6 @@ void set_status(uint64_t* context, uint64_t status) { *(context + 34) = status; 
 void set_nchildren(uint64_t* context, uint64_t nchildren) { *(context + 35) = nchildren; }
 void set_child_exit_code(uint64_t* context, uint64_t exit_code) { *(context + 36) = exit_code; }
 void set_child_pid(uint64_t* context, uint64_t child_pid) { *(context + 37) = child_pid; }
-void set_mappings(uint64_t* context, uint64_t* mappings) { *(context + 38) = (uint64_t) mappings; }
-void set_mmap_base(uint64_t* context, uint64_t mmap_base) { *(context + 39) = mmap_base; }
-
-// mapping
-
-uint64_t* allocate_mapping(){
-  return smalloc(MAPPING_ENTRIES * sizeof(uint64_t));
-}
-
-
-uint64_t* get_mapping_next(uint64_t* m)   { return (uint64_t*) *m; }
-uint64_t  get_mapping_addr(uint64_t* m)   { return *(m + 1); }
-uint64_t  get_mapping_length(uint64_t* m) { return *(m + 2); }
-uint64_t  get_mapping_prot(uint64_t* m)   { return *(m + 3); }
-uint64_t  get_mapping_fd(uint64_t* m)     { return *(m + 4); }
-uint64_t  get_mapping_offset(uint64_t* m) { return *(m + 5); }
-
-void set_mapping_next(uint64_t* m, uint64_t* n)  { *m       = (uint64_t) n; }
-void set_mapping_addr(uint64_t* m, uint64_t a)   { *(m + 1) = a; }
-void set_mapping_length(uint64_t* m, uint64_t l) { *(m + 2) = l; }
-void set_mapping_prot(uint64_t* m, uint64_t p)   { *(m + 3) = p; }
-void set_mapping_fd(uint64_t* m, uint64_t f)     { *(m + 4) = f; }
-void set_mapping_offset(uint64_t* m, uint64_t o) { *(m + 5) = o; }
 
 // -----------------------------------------------------------------
 // -------------------------- MICROKERNEL --------------------------
@@ -6383,6 +6386,11 @@ void selfie_compile() {
   emit_wait();
   emit_open();
 
+
+  emit_mmap();
+  emit_munmap();
+  emit_msync();
+
   emit_malloc();
 
   emit_switch();
@@ -8083,87 +8091,6 @@ void implement_brk(uint64_t* context) {
   }
 }
 
-void emit_mmap(){
-  create_symbol_table_entry(GLOBAL_TABLE, string_copy("mmap"),
-    0, PROCEDURE, UINT64STAR_T, 5, code_size);
-
-  emit_load(REG_A0, REG_SP, 0); // addr
-  emit_addi(REG_SP, REG_SP, WORDSIZE);
-
-  emit_load(REG_A1, REG_SP, 0); // length
-  emit_addi(REG_SP, REG_SP, WORDSIZE);
-
-  emit_load(REG_A2, REG_SP, 0); // prot
-  emit_addi(REG_SP, REG_SP, WORDSIZE);
-
-  emit_load(REG_A3, REG_SP, 0); // fd
-  emit_addi(REG_SP, REG_SP, WORDSIZE);
-
-  emit_load(REG_A4, REG_SP, 0); // offset
-  emit_addi(REG_SP, REG_SP, WORDSIZE);
-
-  emit_addi(REG_A7, REG_ZR, SYSCALL_MMAP);
-
-  emit_ecall();
-
-  emit_jalr(REG_ZR, REG_RA, 0);
-}
-
-void implement_mmap(uint64_t* context) {
-  uint64_t addr;
-  uint64_t length;
-  uint64_t prot;
-  uint64_t fd;
-  uint64_t offset;
-
-  uint64_t num_pages;
-  uint64_t i;
-  uint64_t* frame;
-  uint64_t vpage;
-  uint64_t* entry;
-
-  addr   = *(get_regs(context) + REG_A0);
-  length = *(get_regs(context) + REG_A1);
-  prot   = *(get_regs(context) + REG_A2);
-  fd     = *(get_regs(context) + REG_A3);
-  offset = *(get_regs(context) + REG_A4);
-
-  length = round_up(length, PAGESIZE);
-  num_pages = length / PAGESIZE;
-
-  if (addr == 0) {
-    addr = get_mmap_base(context);
-  }
-
-  i = 0;
-  while (i < num_pages) {
-    frame = palloc();
-
-    lseek(fd, offset + i * PAGESIZE, SEEK_SET);
-    read(fd, frame, PAGESIZE);
-
-    vpage = get_page_of_virtual_address(addr + i * PAGESIZE);
-    map_page(context, vpage, (uint64_t) frame);
-
-    i = i + 1;
-  }
-
-  entry = allocate_mapping();
-  set_mapping_next(entry, get_mappings(context));
-  set_mapping_addr(entry, addr);
-  set_mapping_length(entry, length);
-  set_mapping_prot(entry, prot);
-  set_mapping_fd(entry, fd);
-  set_mapping_offset(entry, offset);
-  set_mappings(context, entry);
-
-  set_mmap_base(context, addr + length);
-
-  *(get_regs(context) + REG_A0) = addr;
-  set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
-
-}
-
 void emit_fork() {
 	create_symbol_table_entry(GLOBAL_TABLE, string_copy("fork"),
 	0, PROCEDURE, UINT64_T, 0, code_size);
@@ -8287,6 +8214,422 @@ void implement_wait(uint64_t* context) {
 		*(get_regs(context) + REG_A0) = -1;
 			set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
 	}
+}
+
+void emit_mmap() {
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("mmap"),
+    0, PROCEDURE, UINT64_T, 6, code_size);
+
+  emit_load(REG_A0, REG_SP, 0); // addr
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A1, REG_SP, 0); // length
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A2, REG_SP, 0); // prot
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A3, REG_SP, 0); // flags
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+  
+  emit_load(REG_A4, REG_SP, 0); // fd
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A5, REG_SP, 0); // offset
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_MMAP);
+
+  emit_ecall();
+
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+uint64_t *create_vma_node(uint64_t *start_vaddr, uint64_t *end_vaddr, uint64_t offset, uint64_t fd, uint64_t prot, uint64_t flags)
+{
+  uint64_t *vma = smalloc(9 * sizeof(uint64_t));
+  if (vma == 0) { return 0; }
+
+  *(vma + 0) = (uint64_t) start_vaddr;
+  *(vma + 1) = (uint64_t) end_vaddr;
+  *(vma + 2) = offset;
+  
+  *(vma + 3) = fd;
+  *(vma + 4) = prot;
+  *(vma + 5) = flags;
+  
+  *(vma + 6) = 0;
+  *(vma + 7) = 0;
+
+  *(vma + 8) = (uint64_t) get_pt(current_context);
+  
+  return vma;
+}
+
+uint64_t insert_undefined_vma_node(uint64_t *context, uint64_t *new_vma, uint64_t size)
+{
+  // curr_vma: [], new_vma: {}, next_vma = ()
+  uint64_t *curr_vma = get_mappings(context);
+
+  if (curr_vma == (uint64_t *) 0) {
+    // {}
+    set_vma_start(new_vma, (uint64_t *) 0);
+    set_vma_end(new_vma, (uint64_t *) (size - 1));
+
+    set_mappings(context, new_vma);
+    
+    return 1;
+  }
+
+  if ((uint64_t *) size <= get_vma_start(curr_vma)) {
+    // {}->[]
+    set_vma_start(new_vma, (uint64_t *) 0);
+    set_vma_end(new_vma, (uint64_t *) (size - 1));
+
+    set_mappings(context, new_vma);
+
+    set_vma_next(new_vma, curr_vma);
+    set_vma_prev(curr_vma, new_vma);
+
+    return 1;
+  }
+
+
+  uint64_t *next_vma = get_vma_next(curr_vma);
+  while (next_vma != (uint64_t *) 0) {
+    next_vma = get_vma_next(curr_vma);
+
+    uint64_t *possible_start = (uint64_t *) ((uint64_t) get_vma_end(curr_vma) + 1),
+             *possible_end   = (uint64_t *) ((uint64_t) get_vma_end(curr_vma) + size);
+
+    if (possible_end < get_vma_start(next_vma)) {
+      // []->{}->()
+      set_vma_start(new_vma, possible_start);
+      set_vma_end(new_vma, possible_end);
+
+      set_vma_prev(new_vma, curr_vma);
+      set_vma_next(new_vma, next_vma);
+
+      set_vma_next(curr_vma, new_vma);
+      set_vma_prev(next_vma, new_vma);
+
+      return 1;
+    }
+
+    curr_vma = next_vma;
+  }
+
+  uint64_t *possible_start = (uint64_t *) ((uint64_t) get_vma_end(curr_vma) + 1),
+           *possible_end   = (uint64_t *) ((uint64_t) get_vma_end(curr_vma) + size);
+
+  if (is_virtual_address_valid((uint64_t) possible_end, WORDSIZE) == 0) {
+    return 0;
+  }
+
+  // []->{}
+  set_vma_start(new_vma, possible_start);
+  set_vma_end(new_vma, possible_end);
+
+  set_vma_prev(new_vma, curr_vma);
+  set_vma_next(curr_vma, new_vma);
+
+  return 1;
+}
+
+
+uint64_t insert_defined_vma_node(uint64_t *context, uint64_t *new_vma)
+{
+  // curr_vma: [], new_vma: {}, next_vma = ()
+
+  uint64_t *start_vaddr = get_vma_start(new_vma);
+  uint64_t *end_vaddr   = get_vma_end(new_vma);
+
+  if (is_virtual_address_valid((uint64_t) end_vaddr, WORDSIZE) == 0) {
+    return 0;
+  }
+
+  uint64_t *curr_vma = get_mappings(context);
+
+  if (curr_vma == (uint64_t *) 0) {
+    // {} = valid
+    set_mappings(context, new_vma);
+    return 1;
+  }
+
+  if (end_vaddr < get_vma_start(curr_vma)) {
+    // {}->[] = valid
+    set_mappings(context, new_vma);
+
+    set_vma_next(new_vma, curr_vma);
+    set_vma_prev(curr_vma, new_vma);
+
+    return 1;
+  }
+
+  while (1) {
+    uint64_t *next_vma = get_vma_next(curr_vma);
+    
+    if (get_vma_end(curr_vma) < start_vaddr) {
+      if (next_vma == (uint64_t *) 0) {
+        // []->{} = valid
+        set_vma_next(curr_vma, new_vma);
+        set_vma_prev(new_vma, curr_vma);
+
+        return 1;
+      }
+
+      if (end_vaddr < get_vma_start(next_vma)) {
+        // []->{}->() = valid
+        set_vma_prev(new_vma, curr_vma);
+        set_vma_next(new_vma, next_vma);
+
+        set_vma_next(curr_vma, new_vma);
+
+        set_vma_prev(next_vma, new_vma);
+
+        return 1;
+      }
+
+      curr_vma = next_vma;
+    } else {
+      // [ { ] } || { [ ] } = invalid
+      return 0;
+    }
+  }
+}
+
+void implement_mmap(uint64_t *context)
+{
+  uint64_t *addr;
+  uint64_t  length;
+  uint64_t  prot;
+  uint64_t  flags;
+  uint64_t  fd;
+  uint64_t  offset;
+
+  addr    = (uint64_t *) *(get_regs(context) + REG_A0);
+  length  = *(get_regs(context) + REG_A1);
+  prot    = *(get_regs(context) + REG_A2);
+  flags   = *(get_regs(context) + REG_A3);
+  fd      = *(get_regs(context) + REG_A4);
+  offset  = *(get_regs(context) + REG_A5);
+
+  // check fd, prot and flags and valid addr and end addr
+  if (length == 0) {
+    *(get_regs(context) + REG_A0) = 0;
+    return;
+  }
+
+  length = round_up(length, PAGESIZE);
+
+  uint64_t *vma = create_vma_node(
+    addr,
+    (uint64_t *) ((uint64_t) addr + (length - 1)),
+    offset,
+    fd,
+    prot,
+    flags
+  );
+
+  if (addr == 0) {
+    if (insert_undefined_vma_node(context, vma, length) == 0) {
+      *(get_regs(context) + REG_A0) = 0;
+      return;
+    }
+  } else {
+    if (insert_defined_vma_node(context, vma) == 0) {
+      *(get_regs(context) + REG_A0) = 0;
+      return;
+    }
+  }
+ 
+  uint64_t *vaddr;
+  vaddr = (uint64_t *) get_vma_start(vma);
+
+  uint64_t curr_vaddr = (uint64_t) vaddr;
+  uint64_t end_vaddr  = curr_vaddr + length;
+
+  uint64_t page;
+
+  while (curr_vaddr  < end_vaddr) {
+    page = curr_vaddr / PAGESIZE;
+    set_PTE_for_page(get_pt(context), page, 0);
+    curr_vaddr = curr_vaddr + PAGESIZE;
+  }
+  
+  *(get_regs(context) + REG_A0) = (uint64_t) vaddr;
+}
+
+void emit_munmap() {
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("munmap"),
+    0, PROCEDURE, UINT64_T, 3, code_size);
+
+  emit_load(REG_A0, REG_SP, 0); // addr
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A1, REG_SP, 0); // length
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_MUNMAP);
+
+  emit_ecall();
+
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+void unmap_page(uint64_t* table, uint64_t page) {
+    uint64_t* pte;
+
+    pte = get_PTE_address_for_page(0, table, page);
+
+    if (pte == (uint64_t*) 0)
+        return;
+
+    *pte = 0;
+}
+
+uint64_t *find_vma_node_by_addr(uint64_t *mappings, uint64_t *vaddr)
+{
+  uint64_t *curr_vma = mappings;
+  
+  while (curr_vma != (uint64_t *) 0) {
+    if (get_vma_start(curr_vma) <= vaddr) {
+      if (vaddr <= get_vma_end(curr_vma)) {
+        return curr_vma;
+      }
+    }
+    curr_vma = curr_vma + PAGESIZE;
+  }
+
+  return (uint64_t *) 0;
+}
+
+void remove_vma_node(uint64_t *mappings, uint64_t *vma)
+{
+  uint64_t *prev_vma = get_vma_prev(vma);
+  uint64_t *next_vma = get_vma_next(vma);
+  
+  if (mappings == vma) {
+    mappings = next_vma;
+  }
+
+  if (prev_vma != (uint64_t *) 0) {
+    set_vma_next(prev_vma, next_vma);
+  }
+
+  if (next_vma != (uint64_t *) 0) {
+    set_vma_prev(next_vma, prev_vma);
+  }
+}
+
+void implement_munmap(uint64_t *context)
+{
+  uint64_t *addr;
+  uint64_t  length;
+
+  addr   = (uint64_t *) *(get_regs(context) + REG_A0);
+  length = round_up(*(get_regs(context) + REG_A1), PAGESIZE);
+
+  uint64_t *pte = get_pt(context);
+  uint64_t *mappings = get_mappings(context);
+
+  uint64_t *vma = find_vma_node_by_addr(mappings, addr);
+  if (addr != get_vma_start(vma)) {
+    *(get_regs(context) + REG_A0) = -1;
+    return;
+  }
+
+  uint64_t curr_page = get_page_of_virtual_address((uint64_t) get_vma_start(vma));
+  uint64_t end_page = get_page_of_virtual_address((uint64_t) get_vma_end(vma));
+
+  uint64_t curr_written = 0;
+  while (curr_page != end_page) {
+    unmap_page(pte, curr_page);
+    curr_written = curr_written + PAGESIZE;
+    if (curr_written == length) {
+      remove_vma_node(mappings, vma);
+      *(get_regs(context) + REG_A0) = 0;
+      return;
+    }
+    // Remove from frame cache even if dirty bit
+    curr_page = curr_page + 1;
+  }
+
+  remove_vma_node(mappings, vma);
+
+  *(get_regs(context) + REG_A0) = 0;
+}
+
+void emit_msync() {
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("msync"),
+    0, PROCEDURE, UINT64_T, 3, code_size);
+
+  emit_load(REG_A0, REG_SP, 0); // addr
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A1, REG_SP, 0); // length
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A2, REG_SP, 0); // flags
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_MSYNC);
+
+  emit_ecall();
+
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+uint64_t has_permission_to_write(uint64_t prot)
+{
+  return((prot / 2) % 2 != 0);
+}
+
+void implement_msync(uint64_t *context)
+{
+  uint64_t *addr;
+  uint64_t  length;
+  uint64_t  flags;
+
+  addr   = (uint64_t *) *(get_regs(context) + REG_A0);
+  length = round_up(*(get_regs(context) + REG_A1), PAGESIZE);
+  flags  = *(get_regs(context) + REG_A2);
+
+  uint64_t *mappings;
+  mappings = get_mappings(context);
+
+  uint64_t *vma;
+  vma = find_vma_node_by_addr(mappings, addr);
+
+  if (vma == (uint64_t *) 0) {
+    *(get_regs(context) + REG_A0) = -1;
+    return;
+  }
+
+  uint64_t prot = get_vma_prot(vma);
+  if (has_permission_to_write(prot) == 0) {
+    *(get_regs(context) + REG_A0) = -1;
+    return;
+  }
+
+  uint64_t fd = get_vma_fd(vma);
+  
+  uint64_t curr_page = get_page_of_virtual_address((uint64_t) get_vma_start(vma));
+  uint64_t end_page = get_page_of_virtual_address((uint64_t) get_vma_end(vma));
+
+  uint64_t curr_written = 0;
+  while (curr_page != end_page) {
+    uint64_t *mapped_mem = (uint64_t *) get_frame_for_page(mappings, curr_page);
+    curr_written = curr_written + write(fd, mapped_mem, PAGESIZE);
+    if (curr_written == length) {
+      *(get_regs(context) + REG_A0) = 0;
+      return;
+    }
+    curr_page = curr_page + 1;
+  }
+
+  *(get_regs(context) + REG_A0) = 0;
+  return;
 }
 
 uint64_t is_boot_level_zero() {
@@ -10253,7 +10596,7 @@ void do_ecall() {
     println();
 
     pc = pc + INSTRUCTIONSIZE;
-  } else if (*(registers + REG_A7) == SYSCALL_SWITCH)
+  } else if (*(registers + REG_A7) == SYSCALL_SWITCH) {
     if (record) {
       printf("%s: context switching during recording is unsupported\n", selfie_name);
 
@@ -10267,29 +10610,33 @@ void do_ecall() {
 
       implement_switch();
     }
+  }
   else {
-	if (*(registers + REG_A7) != SYSCALL_FORK) {
-		read_register(REG_A0);
-		if (*(registers + REG_A7) != SYSCALL_EXIT) {
-			if (*(registers + REG_A7) != SYSCALL_BRK) {
-				if (*(registers + REG_A7) != SYSCALL_WAIT) {
-					read_register(REG_A1);
-					read_register(REG_A2);
+	  if (*(registers + REG_A7) != SYSCALL_FORK) {
+		  read_register(REG_A0);
+		  if (*(registers + REG_A7) != SYSCALL_EXIT) {
+        if (*(registers + REG_A7) != SYSCALL_BRK) {
+          if (*(registers + REG_A7) != SYSCALL_WAIT) {
+            read_register(REG_A1);
 
-					if (*(registers + REG_A7) == SYSCALL_OPENAT || *(registers + REG_A7) == SYSCALL_MMAP) {
-            read_register(REG_A3);
+            if (*(registers + REG_A7) != SYSCALL_MUNMAP) {
+              read_register(REG_A2);
 
-            if (*(registers + REG_A7) == SYSCALL_MMAP) {
-              read_register(REG_A4);
+              if (*(registers + REG_A7) != SYSCALL_MSYNC) {
+                read_register(REG_A3);
+                
+                if (*(registers + REG_A7) != SYSCALL_OPENAT) {    
+                    read_register(REG_A4);
+                    read_register(REG_A5);
+                }
+              }
+            }
           }
-					}
-				}
-			}
+        }
+      }
 
 			write_register(REG_A0);
 		}
-	}
-    
 
     // all system calls other than switch are handled by exception
     throw_exception(EXCEPTION_SYSCALL, *(registers + REG_A7));
@@ -11289,12 +11636,10 @@ void init_context(uint64_t* context, uint64_t* parent, uint64_t* vctxt) {
   set_gcs_in_period(context, 0);
   set_use_gc_kernel(context, GC_DISABLED);
 
-  // memory mappings
-  set_mappings(context, (uint64_t*) 0);
-  set_mmap_base(context, 2 * GIGABYTE); // ponemos la base de mmap en 2GB , que queda en la mitad de la memoria virtual, lo que lo dejaria suficientemente lejos del heap y del stack, eso entendi. 
-
   set_status(context, STATUS_READY);
   set_nchildren(context, 0);
+
+  set_mappings(context, (uint64_t *) 0);
 }
 
 uint64_t* find_context(uint64_t* parent, uint64_t* vctxt) {
@@ -11913,8 +12258,6 @@ uint64_t handle_system_call(uint64_t* context) {
     implement_fork(context);
   else if (a7 == SYSCALL_WAIT)
     implement_wait(context);
-  else if (a7 == SYSCALL_MMAP)
-    implement_mmap(context);
   else if (a7 == SYSCALL_EXIT) {
     implement_exit(context);
 
