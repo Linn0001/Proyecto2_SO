@@ -8552,13 +8552,13 @@ uint64_t *find_vma_node_by_addr(uint64_t *mappings, uint64_t *vaddr)
   return (uint64_t *) 0;
 }
 
-void remove_vma_node(uint64_t *mappings, uint64_t *vma)
+void remove_vma_node(uint64_t *context, uint64_t *mappings, uint64_t *vma)
 {
   uint64_t *prev_vma = get_vma_prev(vma);
   uint64_t *next_vma = get_vma_next(vma);
   
   if (mappings == vma) {
-    mappings = next_vma;
+    set_mappings(context, next_vma);
   }
 
   if (prev_vma != (uint64_t *) 0) {
@@ -8591,19 +8591,22 @@ void implement_munmap(uint64_t *context)
   uint64_t end_page = get_page_of_virtual_address((uint64_t) get_vma_end(vma));
 
   uint64_t curr_written = 0;
-  while (curr_page != end_page) {
+  while (curr_page <= end_page) {
     unmap_page(pte, curr_page);
     curr_written = curr_written + PAGESIZE;
-    if (curr_written == length) {
-      remove_vma_node(mappings, vma);
-      *(get_regs(context) + REG_A0) = 0;
-      return;
-    }
     // Remove from frame cache even if dirty bit
     curr_page = curr_page + 1;
+
+     if (curr_written == length) {
+      if (curr_page <= end_page) {
+        set_vma_start(vma, (uint64_t *) (curr_page * PAGESIZE));
+        *(get_regs(context) + REG_A0) = 0;
+        return;
+      }
+    }
   }
 
-  remove_vma_node(mappings, vma);
+  remove_vma_node(context, mappings, vma);
 
   *(get_regs(context) + REG_A0) = 0;
 }
@@ -8666,8 +8669,8 @@ void implement_msync(uint64_t *context)
   uint64_t end_page = get_page_of_virtual_address((uint64_t) get_vma_end(vma));
 
   uint64_t curr_written = 0;
-  while (curr_page != end_page) {
-    uint64_t *mapped_mem = (uint64_t *) get_frame_for_page(mappings, curr_page);
+  while (curr_page <= end_page) {
+    uint64_t *mapped_mem = (uint64_t *) get_frame_for_page(get_pt(context), curr_page);
     curr_written = curr_written + write(fd, mapped_mem, PAGESIZE);
     if (curr_written == length) {
       *(get_regs(context) + REG_A0) = 0;
