@@ -2332,6 +2332,9 @@ void set_vma_prev(uint64_t *vma, uint64_t *prev_vma) { *(vma + 7) = (uint64_t) p
 uint64_t *get_vma_original_pte(uint64_t *vma) { return (uint64_t *) *(vma + 8); }
 void set_vma_original_pte(uint64_t *vma, uint64_t *original_pte) { *(vma + 8) = (uint64_t) original_pte; }
 
+
+uint64_t *create_vma_node(uint64_t *start_vaddr, uint64_t *end_vaddr, uint64_t offset, uint64_t fd, uint64_t prot, uint64_t flags);
+
 uint64_t* get_next_context(uint64_t* context)    { return (uint64_t*) *context; }
 uint64_t* get_prev_context(uint64_t* context)    { return (uint64_t*) *(context + 1); }
 uint64_t  get_pc(uint64_t* context)              { return             *(context + 2); }
@@ -8164,6 +8167,51 @@ void implement_fork(uint64_t* context) {
 	set_ec_timer(child, get_ec_timer(context));
 	set_mc_stack_peak(child, get_mc_stack_peak(context));
 	set_mc_mapped_heap(child, get_mc_mapped_heap(context));
+
+  /* Copy mappings */
+  uint64_t *mappings = get_mappings(context);
+  uint64_t *new_mapping = (uint64_t *) 0;
+  uint64_t *prev_vma = (uint64_t *) 0;
+  while (mappings != (uint64_t *) 0) {
+    uint64_t mmap_flags = get_vma_flags(mappings);
+
+    uint64_t *new_node = create_vma_node(
+      get_vma_start(mappings),
+      get_vma_end(mappings),
+      get_vma_offset(mappings),
+      get_vma_fd(mappings),
+      get_vma_prot(mappings),
+      get_vma_flags(mappings)
+    );
+    uint64_t *original_pte = get_vma_original_pte(context);
+
+    set_vma_original_pte(new_node, original_pte);
+
+    uint64_t *curr_addr = get_vma_start(mappings);
+    while (curr_addr != get_vma_end(mappings)) {
+      uint64_t page = get_page_of_virtual_address((uint64_t) curr_addr);
+
+      if ((mmap_flags >> 0) % 2 != 0) {
+        // MAP_SHARED is set
+        uint64_t frame = get_frame_for_page(original_pte, page);
+        set_PTE_for_page(get_pt(child), page, frame);
+      } else {
+        set_PTE_for_page(get_pt(child), page, 0);
+      }
+    }
+
+    if (new_mapping == (uint64_t *) 0) {
+      new_mapping = new_node;
+    } else {
+      set_vma_next(prev_vma, new_node);
+      set_vma_prev(new_node, prev_vma);
+    }
+
+    prev_vma = new_node;
+    mappings = get_vma_next(mappings);
+  }
+
+  set_mappings(child, new_mapping);
 
 	set_nchildren(context, get_nchildren(context) + 1);
 
